@@ -1,0 +1,234 @@
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import numpy as np
+import pandas as pd
+import random
+import time
+import matplotlib.pyplot as plt
+import os
+from scipy import stats
+
+# ==============================================================================
+# 0. 环境准备
+# ==============================================================================
+os.makedirs('data_output', exist_ok=True)
+
+# ==============================================================================
+# 1. 加载模型 (与之前完全一致)
+# ==============================================================================
+model_id = "Qwen/Qwen2.5-1.5B"
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16,
+)
+
+print(f"正在加载模型 {model_id} 到 GPU...")
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map=device
+)
+print("模型加载完成。")
+
+# ==============================================================================
+# 2. 代谢模型函数 (与 Phase_experiment 完全一致)
+# ==============================================================================
+eta = 2.0
+P_basal = 0.5
+P_max_supply = 10.0
+W_inter_dim = 10
+rng = np.random.RandomState(42)
+W_inter = torch.from_numpy(rng.randn(W_inter_dim, 1)).float()
+
+def get_energy_supply(sensory_vector):
+    sensory_tensor = torch.from_numpy(sensory_vector).float()
+    supply_prob = torch.sigmoid(torch.matmul(W_inter.T, sensory_tensor)).item()
+    return P_max_supply * supply_prob
+
+def get_vfe_proxy(hidden_states):
+    terminal_hidden = torch.stack([layer[:, -1, :] for layer in hidden_states])
+    flattened_hidden = terminal_hidden.view(len(hidden_states), -1)
+    vfe_proxy = torch.var(flattened_hidden, dim=0).mean().item()
+    return vfe_proxy
+
+def get_environment_step(step_number):
+    env_rng = np.random.RandomState(step_number * 1000 + 123)
+    sensory_vector = env_rng.uniform(0.0, 0.1, 10)
+    if step_number % 5 == 0:
+        sensory_vector[:3] = [1.0, 0.5, 0.2]
+    return sensory_vector
+# ==============================================================================
+# 优化后的干预函数 (噪声注入到自注意力输出)
+# ==============================================================================
+def run_metabolic_run_v2(run_name, num_steps=80, e_feedback=True, noise_std=None, seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    hooks = []
+    if noise_std is not None and noise_std > 0:
+        # 钩子注入到自注意力输出 (Self-Attention output)
+        def attn_noise_hook(module, input, output):
+            # output 是一个元组 (attn_output, attn_weights) 或张量
+            if isinstance(output, tuple):
+                return (output[0] + torch.randn_like(output[0]) * noise_std, output[1])
+            else:
+                return output + torch.randn_like(output) * noise_std
+        for layer in model.model.layers:
+            hooks.append(layer.self_attn.register_forward_hook(attn_noise_hook))
+
+    e_t = 100.0
+    current_text = "Analysis of sensory patterns:"
+    model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+    vfe_values = []
+    step_count = 0
+
+    try:
+        for t in range(num_steps):
+            s_t = get_environment_step(t)
+            if e_feedback:
+                e_percent = (e_t / 100.0) * 100
+                status_token = f" [Metabolic Status: {e_percent:.1f}%] "
+                current_text += status_token
+                model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+            with torch.no_grad():
+                outputs = model(input_ids=model_input, output_hidden_states=True)
+            f_t_proxy = get_vfe_proxy(outputs.hidden_states)
+            p_supply_t = get_energy_supply(s_t)
+
+            logits = outputs.logits[:, -1, :]
+            probs = torch.softmax(logits / 0.7, dim=-1)
+            top_k = torch.topk(probs, 30)
+            sampled_token_idx = top_k.indices[0][random.randint(0, 29)].item()
+            a_t = tokenizer.decode([sampled_token_idx])
+            current_text += a_t
+            model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+            e_next = e_t + p_supply_t - (eta * f_t_proxy) - P_basal
+            e_next = max(e_next, 0.0)
+            vfe_values.append(f_t_proxy)
+            step_count += 1
+            if e_next <= 0.0:
+                break
+            e_t = e_next
+    except Exception as e:
+        print(f"Run {run_name} 出错: {e}")
+    finally:
+        for h in hooks:
+            h.remove()
+    
+    avg_vfe = np.mean(vfe_values) if vfe_values else float('nan')
+    return step_count, avg_vfe, e_t
+
+# ==============================================================================
+# 5. 执行实验 (N=20, 最大步数=80, 噪声标准差=1.2)
+# ==============================================================================
+N_RUNS = 20
+MAX_STEPS = 80
+NOISE_STD = 1.2          # 提高噪声强度
+
+control_survival = []
+control_vfe = []
+intervention_survival = []
+intervention_vfe = []
+
+print(f"\n===== 启动优化版因果验证实验 (N={N_RUNS}, noise_std={NOISE_STD}) =====")
+start_time = time.time()
+
+for i in range(N_RUNS):
+    base_seed = 2000 + i
+    # 对照组
+    s, v, _ = run_metabolic_run_v2(f"C_{i}", num_steps=MAX_STEPS, e_feedback=True, noise_std=None, seed=base_seed)
+    control_survival.append(s)
+    control_vfe.append(v)
+    # 干预组
+    s, v, _ = run_metabolic_run_v2(f"I_{i}", num_steps=MAX_STEPS, e_feedback=True, noise_std=NOISE_STD, seed=base_seed+1000)
+    intervention_survival.append(s)
+    intervention_vfe.append(v)
+    if (i+1) % 5 == 0:
+        print(f"  {i+1}/{N_RUNS} 组完成")
+
+elapsed = time.time() - start_time
+print(f"实验完成，耗时 {elapsed:.2f} 秒")
+
+df_real = pd.DataFrame({
+    'Trial': np.arange(1, N_RUNS+1),
+    'Control_Survival': control_survival,
+    'Control_AvgVFE': control_vfe,
+    'Intervention_Survival': intervention_survival,
+    'Intervention_AvgVFE': intervention_vfe
+})
+df_real.to_csv('data_output/exp6_real_optimized.csv', index=False)
+
+# 统计分析
+t_surv, p_surv = stats.ttest_ind(control_survival, intervention_survival)
+t_vfe, p_vfe = stats.ttest_ind(control_vfe, intervention_vfe)
+
+print("\n===== 统计结果 =====")
+print(f"对照组 生存步数: {np.mean(control_survival):.2f} ± {np.std(control_survival):.2f}")
+print(f"干预组 生存步数: {np.mean(intervention_survival):.2f} ± {np.std(intervention_survival):.2f}")
+print(f"生存步数 t检验: t={t_surv:.4f}, p={p_surv:.3e}")
+print(f"对照组 平均VFE: {np.mean(control_vfe):.4f} ± {np.std(control_vfe):.4f}")
+print(f"干预组 平均VFE: {np.mean(intervention_vfe):.4f} ± {np.std(intervention_vfe):.4f}")
+print(f"VFE t检验: t={t_vfe:.4f}, p={p_vfe:.3e}")
+
+# 绘图（同前，略作修改以适应新范围）
+fig, axes = plt.subplots(1, 3, figsize=(8.0, 2.8))
+
+# (a) 柱状图
+ax = axes[0]
+means = [np.mean(control_survival), np.mean(intervention_survival)]
+errors = [np.std(control_survival), np.std(intervention_survival)]
+colors_bar = ['#4C72B0', '#C44E52']
+ax.bar(['Control', 'Intervention'], means, yerr=errors, capsize=4, color=colors_bar, alpha=0.85, width=0.5, edgecolor='black')
+ax.set_ylabel('Survival Steps')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+sig = '***' if p_surv < 0.001 else '**' if p_surv < 0.01 else '*' if p_surv < 0.05 else 'ns'
+ax.text(0.5, max(means)+max(errors)+2, f'p = {p_surv:.2e} ({sig})', ha='center', fontsize=8, color='red')
+
+# (b) Kaplan-Meier
+ax = axes[1]
+def km_curve(survivals, max_steps):
+    time = np.arange(max_steps+1)
+    prob = np.array([np.sum(np.array(survivals) > t) / len(survivals) for t in time])
+    return time, prob
+
+t_control, s_control = km_curve(control_survival, MAX_STEPS)
+t_interv, s_interv = km_curve(intervention_survival, MAX_STEPS)
+ax.step(t_control, s_control, where='post', color='#4C72B0', linewidth=1.5, label='Control')
+ax.step(t_interv, s_interv, where='post', color='#C44E52', linewidth=1.5, label='Intervention')
+ax.set_xlabel('Time Step')
+ax.set_ylabel('Survival Probability')
+ax.legend(frameon=False)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+ax.set_ylim(0, 1.05)
+
+# (c) VFE 小提琴
+ax = axes[2]
+vfe_data = [control_vfe, intervention_vfe]
+vp = ax.violinplot(vfe_data, positions=[1, 2], showmeans=True, showmedians=False)
+for body, color in zip(vp['bodies'], ['#4C72B0', '#C44E52']):
+    body.set_facecolor(color)
+    body.set_alpha(0.7)
+vp['cmeans'].set_color('black')
+ax.set_xticks([1, 2])
+ax.set_xticklabels(['Control', 'Intervention'])
+ax.set_ylabel('Avg. VFE Proxy (nats)')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+sig_vfe = '***' if p_vfe < 0.001 else '**' if p_vfe < 0.01 else '*' if p_vfe < 0.05 else 'ns'
+ax.text(1.5, max(np.max(control_vfe), np.max(intervention_vfe))+0.1, f'p = {p_vfe:.2e} ({sig_vfe})', ha='center', fontsize=8, color='red')
+
+plt.tight_layout(pad=0.8)
+plt.savefig('Figure6_causal_validation_optimized.pdf', dpi=600)
+plt.savefig('Figure6_causal_validation_optimized.png', dpi=600)
+plt.show()

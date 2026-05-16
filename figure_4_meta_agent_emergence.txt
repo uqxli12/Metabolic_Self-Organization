@@ -1,0 +1,95 @@
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+# ==============================================================================
+# 函数定义
+# ==============================================================================
+def calculate_meta_metrics_v2(df, window=10):
+    """
+    计算修正后的涌现唯象指标。
+    - Gamma: 推理效率 (E/F)
+    - Coupling_Stability: 能量与VFE的滚动相关系数
+    - Gamma_mc_proxy: 因果闭合代理 (Granger ratio)
+    - S_meta_proxy: 代谢自发性代理 (能量缺口驱动的VFE压缩)
+    - TIC_proxy: 时间整合代理 (Supply-VFE相关性的持续度)
+    """
+    df = df.copy()
+
+    # 1. 推理效率
+    df['Gamma'] = df['Energy'] / (df['VFE'] + 1e-9)
+
+    # 2. 代谢-认知耦合稳定性 (用相关系数代替易爆炸的比率)
+    df['Coupling_Stability'] = df['Energy'].rolling(window).corr(df['VFE'])
+
+    # 3. 因果闭合代理（基于 Granger 思想的简化 R² 比率）
+    def granger_ratio_series(e, f, s, w):
+        ratios = []
+        for i in range(len(e)):
+            if i < w:
+                ratios.append(np.nan)
+                continue
+            start = i - w
+            end = i
+            e_lag = e.shift(1).iloc[start:end].values.reshape(-1, 1)
+            s_lag = s.shift(1).iloc[start:end].values.reshape(-1, 1)
+            f_cur = f.iloc[start:end].values
+
+            # 去除包含 NaN 的样本
+            mask = ~np.isnan(e_lag.flatten()) & ~np.isnan(f_cur) & ~np.isnan(s_lag.flatten())
+            if np.sum(mask) < 5:
+                ratios.append(np.nan)
+                continue
+
+            # 用滞后 Energy 预测当前 VFE
+            lr_e = LinearRegression().fit(e_lag[mask], f_cur[mask])
+            r2_e = lr_e.score(e_lag[mask], f_cur[mask])
+            # 用滞后 Supply 预测当前 VFE
+            lr_s = LinearRegression().fit(s_lag[mask], f_cur[mask])
+            r2_s = lr_s.score(s_lag[mask], f_cur[mask])
+
+            if r2_s == 0:
+                ratios.append(np.nan)
+            else:
+                ratios.append(r2_e / (r2_s + 1e-9))
+        return ratios
+
+    df['Gamma_mc_proxy'] = granger_ratio_series(df['Energy'], df['VFE'], df['Supply'], window)
+
+    # 4. 代谢自发性代理：能量缺口 × VFE 压缩量
+    E_initial = df['Energy'].iloc[0]
+    delta_E = E_initial - df['Energy']               # 能量已消耗量，越大表示压力越大
+    delta_VFE = -df['VFE'].diff()                    # VFE 下降量，正值表示压缩
+    df['S_meta_proxy'] = delta_E * delta_VFE.clip(lower=0)  # 只奖励压缩，忽略上升
+
+    # 5. 时间整合代理：环境-认知相关系数的自相关
+    supply_vfe_corr = df['Supply'].rolling(window).corr(df['VFE'])
+    df['TIC_proxy'] = supply_vfe_corr.rolling(window).apply(
+        lambda x: x.autocorr(lag=1) if len(x.dropna()) >= 3 else np.nan
+    )
+
+    return df
+
+# ==============================================================================
+# 加载 Phase III 数据并分析
+# ==============================================================================
+# 请确保 interoceptive_feedback.csv 在相同目录下
+df_p3 = pd.read_csv('interoceptive_feedback.csv')
+
+# 计算指标
+df_final = calculate_meta_metrics_v2(df_p3, window=10)
+
+# 输出后期（Step 20-31）的平均统计
+stable_phase = df_final.iloc[20:]  # Step 20 到 30 (共11步)
+print("\n>>> 修正版全指标分析完成")
+print(f"稳态后期 (Step 20-31) 统计:")
+if not stable_phase.empty:
+    print(f"  平均推理效率 (Gamma)                : {stable_phase['Gamma'].mean():.4f}")
+    print(f"  平均耦合稳定性 (Coupling_Stability) : {stable_phase['Coupling_Stability'].mean():.4f}")
+    print(f"  平均因果闭合代理 (Γ_mc_proxy)       : {stable_phase['Gamma_mc_proxy'].mean():.4f}")
+    print(f"  平均代谢自发性代理 (S_meta_proxy)   : {stable_phase['S_meta_proxy'].mean():.4f}")
+    print(f"  平均时间整合代理 (TIC_proxy)        : {stable_phase['TIC_proxy'].mean():.4f}")
+
+# 保存完整指标
+df_final.to_csv('emergence_metrics_v2.csv', index=False)
+print("\n指标数据已保存至 emergence_metrics_v2.csv")

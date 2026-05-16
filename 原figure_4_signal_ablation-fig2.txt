@@ -1,0 +1,75 @@
+# ==============================================================================
+# --- 6. 信号抹除测试 (Causal Ablation Test) ---
+# ==============================================================================
+
+def run_ablation_test(df_feedback_run, num_steps=15, seed_offset=1000):
+    """
+    从一次内感受反馈运行的末尾接续，移除反馈信号，观察剩余能量动态。
+    df_feedback_run: 如 df_p3 (interoceptive_feedback.csv 读入)
+    返回: DataFrame 包含抹除阶段的 Step, Energy, VFE, Supply, Action
+    """
+    # 初始化状态：延续最后的文本和能量
+    last_step = df_feedback_run['Step'].iloc[-1]
+    e_t = df_feedback_run['Energy'].iloc[-1]
+    
+    # 重建文本序列，过滤掉 NaN 或非字符串值
+    actions = df_feedback_run['Action'].tolist()
+    base_prompt = "Analysis of sensory patterns:"
+    # 仅保留有效的字符串 action，将 NaN 转为空字符串
+    valid_actions = [str(a) if isinstance(a, str) else '' for a in actions]
+    current_text = base_prompt + "".join(valid_actions)
+
+    ablation_data = []
+    
+    for t_offset in range(num_steps):
+        step_global = last_step + 1 + t_offset
+        s_t = get_environment_step(step_global)  # 环境与主实验完全一致
+        
+        # ========= 抹除操作：不插入 [Metabolic Status] 令牌 =========
+        model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            outputs = model(input_ids=model_input, output_hidden_states=True)
+        
+        # 与主实验完全相同的代谢计算
+        f_t_proxy = get_vfe_proxy(outputs.hidden_states)
+        p_supply_t = get_energy_supply(s_t)  # 使用相同的内感受分类器
+
+        # 动作采样
+        logits = outputs.logits[:, -1, :]
+        probs = torch.softmax(logits / 0.7, dim=-1)
+        top_k_indices = torch.topk(probs, 30).indices[0]
+        sampled_idx = top_k_indices[random.randint(0, 29)].item()
+        a_t = tokenizer.decode([sampled_idx])
+
+        current_text += a_t
+        model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+        # 代谢更新（与主实验完全相同，无额外常数）
+        e_next = e_t + p_supply_t - (eta * f_t_proxy) - P_basal
+        e_next = max(e_next, 0.0)
+
+        ablation_data.append({
+            'Step': step_global,
+            'Energy': e_t,
+            'VFE': f_t_proxy,
+            'Supply': p_supply_t,
+            'Action': a_t.strip(),
+            'Condition': 'Ablation'
+        })
+
+        if e_next <= 0.0:
+            print(f"  Ablation step {step_global}: 代谢崩溃 (E = {e_t:.2f}).")
+            break
+        e_t = e_next
+
+    return pd.DataFrame(ablation_data)
+
+# 执行抹除测试（从 interoceptive_feedback.csv 的数据开始）
+df_p3_extend = pd.read_csv('interoceptive_feedback.csv')
+df_ablation = run_ablation_test(df_p3_extend, num_steps=15, seed_offset=500)
+df_ablation.to_csv('ablation_test_data.csv', index=False)
+
+print("\n=== 抹除测试完成 ===")
+print(f"抹除阶段持续步数: {len(df_ablation)}")
+print(f"最终能量: {df_ablation['Energy'].iloc[-1]:.2f}" if len(df_ablation)>0 else "立即崩溃")

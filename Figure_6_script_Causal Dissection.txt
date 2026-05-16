@@ -1,0 +1,250 @@
+#在真实 LLM 代谢循环中，将注入提示词中的能量百分比固定为常数（例如 50%），其余一切保持与标准 Phase III 一致，观察生存差异
+#通过 hook 向 Transformer 层注入两类功率相等但结构不同的噪声——白噪声（无时间相关）vs. 的 OU 过程噪声（有时间相关），比较生存曲线。检验“时间相干性是稳定性的首要决定因素”
+#在标准 run_phase_experiment 函数中，将用于生成反馈 token 的能量值 E∗(t)E ∗ (t) 替换为延迟值 E∗(t−τ)E∗ (t−τ)，而实际的能量更新仍使用当前 VFE 和补给。以此真实运行并记录生存步数
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import numpy as np
+import pandas as pd
+import random
+import time
+import matplotlib.pyplot as plt
+from scipy import stats
+from collections import deque
+
+# ==============================================================================
+# 1. 模型与代谢函数
+# ==============================================================================
+model_id = "Qwen/Qwen2.5-1.5B"
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16,
+)
+
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map=device
+)
+
+eta = 2.0
+P_basal = 0.5
+P_max_supply = 10.0
+rng = np.random.RandomState(42)
+W_inter = torch.from_numpy(rng.randn(10, 1)).float()
+
+def get_energy_supply(s):
+    return P_max_supply * torch.sigmoid(torch.matmul(W_inter.T, torch.from_numpy(s).float())).item()
+
+def get_vfe_proxy(hidden_states):
+    terminal = torch.stack([layer[:, -1, :] for layer in hidden_states])
+    return torch.var(terminal.view(len(hidden_states), -1), dim=0).mean().item()
+
+def get_env(step):
+    rng_env = np.random.RandomState(step * 1000 + 123)
+    vec = rng_env.uniform(0.0, 0.1, 10)
+    if step % 5 == 0:
+        vec[:3] = [1.0, 0.5, 0.2]
+    return vec
+
+# ==============================================================================
+# 2. 通用代谢运行函数 (支持恒定、延迟、白噪声)
+# ==============================================================================
+def run_metabolic_run(seed=0, max_steps=80, feedback_mode='real',
+                      noise_type=None, noise_std=0.0, delay=0):
+    """
+    feedback_mode: 'real' / 'constant' / 'delayed'
+    noise_type: None / 'white' / 'ou' (ou将在后面单独运行)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    hooks = []
+    if noise_type == 'white' and noise_std > 0:
+        def white_hook(module, input, output):
+            if isinstance(output, tuple):
+                out = output[0].clone()
+                noise = torch.randn_like(out) * noise_std
+                return (out + noise, output[1])
+            else:
+                return output + torch.randn_like(output) * noise_std
+        for layer in model.model.layers:
+            hooks.append(layer.self_attn.register_forward_hook(white_hook))
+
+    # 初始状态
+    e_t = 100.0
+    energy_history = deque(maxlen=delay + 1)
+    energy_history.append(e_t)
+    current_text = "Analysis of sensory patterns:"
+    model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+    vfe_vals = []
+    steps_survived = 0
+
+    try:
+        for t in range(max_steps):
+            s_t = get_env(t)
+
+            # 计算反馈能量值
+            if feedback_mode == 'constant':
+                e_feedback = 50.0
+            elif feedback_mode == 'delayed':
+                if len(energy_history) > delay:
+                    e_feedback = energy_history[0]
+                else:
+                    e_feedback = e_t
+            else:
+                e_feedback = e_t
+
+            # 注入状态令牌
+            status_token = f" [Metabolic Status: {e_feedback / 100 * 100:.1f}%] "
+            current_text += status_token
+            model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+            with torch.no_grad():
+                outputs = model(input_ids=model_input, output_hidden_states=True)
+
+            f_t = get_vfe_proxy(outputs.hidden_states)
+            p_sup = get_energy_supply(s_t)
+
+            # 动作采样
+            logits = outputs.logits[:, -1, :]
+            probs = torch.softmax(logits / 0.7, dim=-1)
+            top_k = torch.topk(probs, 30)
+            a_t = tokenizer.decode([top_k.indices[0][random.randint(0, 29)].item()])
+            current_text += a_t
+            model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+            e_next = e_t + p_sup - (eta * f_t) - P_basal
+            e_next = max(e_next, 0.0)
+            vfe_vals.append(f_t)
+            steps_survived += 1
+
+            if e_next <= 0:
+                break
+            e_t = e_next
+            energy_history.append(e_t)
+
+    except Exception as e:
+        print(f"Run seed={seed} error: {e}")
+    finally:
+        for h in hooks:
+            h.remove()
+
+    avg_vfe = np.mean(vfe_vals) if vfe_vals else float('nan')
+    return steps_survived, avg_vfe
+
+# ==============================================================================
+# 3. 运行四组对照实验 (N=15)
+# ==============================================================================
+N = 15
+MAX_STEPS = 80
+conditions = [
+    ('Real Feedback (Control)', 'real', None, 0.0, 0),
+    ('Constant Feedback (50%)', 'constant', None, 0.0, 0),
+    ('Delayed Feedback (τ=5)', 'delayed', None, 0.0, 5),
+    ('White Noise (σ=1.0)', 'real', 'white', 1.0, 0),
+]
+
+results = {}
+for name, fb, ntype, ns, dl in conditions:
+    surv, vfe_list = [], []
+    print(f"\n--- {name} ---")
+    for i in range(N):
+        seed = 3000 + i
+        s, v = run_metabolic_run(seed=seed, max_steps=MAX_STEPS,
+                                feedback_mode=fb, noise_type=ntype,
+                                noise_std=ns, delay=dl)
+        surv.append(s)
+        vfe_list.append(v)
+        print(f"  Seed {seed}: survival={s}, avg VFE={v:.3f}")
+    results[name] = {'survival': surv, 'avg_vfe': vfe_list}
+    print(f"--> Mean survival = {np.mean(surv):.2f} ± {np.std(surv):.2f}")
+
+# 保存数据
+df_all = pd.DataFrame({k.replace(' ','_').replace('(','').replace(')','').replace('%','') + '_surv': v['survival']
+                       for k, v in results.items()})
+df_all.to_csv('figure8_control_real_data_v2.csv', index=False)
+print("\n主实验数据已保存至 figure8_control_real_data_v2.csv")
+
+# ==============================================================================
+# 4. OU 噪声实验单独运行 (修正 dtype)
+# ==============================================================================
+def run_ou_noise_experiment(N=15, max_steps=80, noise_std=1.0, theta=0.15):
+    surv_list = []
+    for i in range(N):
+        seed = 4000 + i
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+        ou_states = {}  # 每层独立状态
+        def ou_hook(module, input, output):
+            nonlocal ou_states
+            if isinstance(output, tuple):
+                ref = output[0]
+                key = id(module)
+                if key not in ou_states:
+                    ou_states[key] = torch.zeros(ref.shape[-1], device=ref.device, dtype=ref.dtype)
+                state = ou_states[key]
+                noise = torch.randn_like(state) * noise_std
+                state = state - theta * state + noise * np.sqrt(2 * theta)
+                out_noised = ref + state.unsqueeze(0).unsqueeze(0)
+                return (out_noised, output[1])
+            else:
+                ref = output
+                key = id(module)
+                if key not in ou_states:
+                    ou_states[key] = torch.zeros(ref.shape[-1], device=ref.device, dtype=ref.dtype)
+                state = ou_states[key]
+                noise = torch.randn_like(state) * noise_std
+                state = state - theta * state + noise * np.sqrt(2 * theta)
+                return ref + state.unsqueeze(0).unsqueeze(0)
+
+        hooks = [layer.self_attn.register_forward_hook(ou_hook)
+                 for layer in model.model.layers]
+
+        s, _ = run_metabolic_run(seed=seed, max_steps=max_steps, feedback_mode='real',
+                                noise_type=None, noise_std=0.0)  # hooks 已手动添加
+        surv_list.append(s)
+        for h in hooks:
+            h.remove()
+        print(f"  OU seed={seed}: survival={s}")
+    return surv_list
+
+print("\n--- OU Noise (σ=1.0) ---")
+ou_surv = run_ou_noise_experiment(N=15, max_steps=80, noise_std=1.0)
+print(f"OU Noise mean survival = {np.mean(ou_surv):.2f} ± {np.std(ou_surv):.2f}")
+
+# 保存 OU 数据
+df_ou = pd.DataFrame({'OU_Noise_surv': ou_surv})
+df_ou.to_csv('figure8_ou_noise_real.csv', index=False)
+
+# ==============================================================================
+# 5. 绘图（五组对比）
+# ==============================================================================
+# 合并 OU 数据到 results
+results['OU Noise (σ=1.0)'] = {'survival': ou_surv, 'avg_vfe': [np.nan]*len(ou_surv)}
+
+fig, ax = plt.subplots(figsize=(8, 4))
+names = list(results.keys())
+means = [np.mean(results[n]['survival']) for n in names]
+errs = [np.std(results[n]['survival']) for n in names]
+colors = ['#4C72B0', '#DDCC77', '#CC6677', '#882255', '#6699CC']
+
+ax.bar(names, means, yerr=errs, capsize=5, color=colors, edgecolor='black')
+ax.set_ylabel('Survival Steps')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.xticks(rotation=15, ha='right')
+plt.tight_layout()
+plt.savefig('Figure8_controls_all.pdf', dpi=600)
+plt.savefig('Figure8_controls_all.png', dpi=600)
+plt.show()
+
+print("\n所有实验完成，图表已保存。")

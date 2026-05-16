@@ -1,0 +1,60 @@
+# ==============================================================================
+# --- 修正的参数空间扫描：单独考察代谢惩罚 eta 对动态的影响 ---
+# ==============================================================================
+import numpy as np
+import pandas as pd
+
+def run_eta_sensitivity(eta_values=[1.0, 1.5, 2.0, 2.5, 3.0], 
+                        fixed_P_basal=0.5, 
+                        num_steps=50, 
+                        repetitions=5, 
+                        base_seed=500):
+    global eta, P_basal
+    # 保存当前的全局值，以便结束后恢复
+    initial_eta = eta
+    initial_P_basal = P_basal
+
+    results = []
+    for eta_val in eta_values:
+        for rep in range(repetitions):
+            seed = base_seed + int(eta_val * 100) + rep
+            # 设置本次实验的全局参数
+            eta = eta_val
+            P_basal = fixed_P_basal
+
+            df_temp = run_phase_experiment(
+                f'Scan_eta{eta_val}_rep{rep}', 
+                num_steps=num_steps, 
+                e_feedback=True, 
+                seed=seed
+            )
+            
+            if not df_temp.empty:
+                final_energy = df_temp['Energy'].iloc[-1]
+                survival_steps = len(df_temp)
+                avg_vfe = df_temp['VFE'].mean()
+                vfe_last10 = df_temp['VFE'].iloc[-10:].mean() if survival_steps >= 10 else avg_vfe
+            else:
+                final_energy = 0.0
+                survival_steps = 0
+                avg_vfe = float('nan')
+                vfe_last10 = float('nan')
+
+            results.append({
+                'eta': eta_val,
+                'rep': rep,
+                'Final_Energy': final_energy,
+                'Survival_Steps': survival_steps,
+                'Avg_VFE': avg_vfe,
+                'VFE_last10': vfe_last10
+            })
+    
+    # 恢复全局默认值
+    eta = initial_eta
+    P_basal = initial_P_basal
+    return pd.DataFrame(results)
+
+# 运行扫描
+df_eta_scan = run_eta_sensitivity()
+df_eta_scan.to_csv('eta_sensitivity_data.csv', index=False)
+print("eta sensitivity scan completed.")

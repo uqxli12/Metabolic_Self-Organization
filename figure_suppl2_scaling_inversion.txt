@@ -1,0 +1,243 @@
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import numpy as np
+import pandas as pd
+import random
+import time
+import matplotlib.pyplot as plt
+from scipy.stats import linregress
+
+# ==============================================================================
+# 1. 模型与代谢函数
+# ==============================================================================
+model_id = "Qwen/Qwen2.5-1.5B"
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16,
+)
+
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+print(f"正在加载模型 {model_id} 到 {device}...")
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map=device
+)
+print("模型加载完成。")
+
+ETA_FIXED = 1.6          # η=1.6：介于1.5（稳定区）和2.0（临界区）之间
+P_basal = 0.5
+P_max_supply = 10.0
+rng = np.random.RandomState(42)
+W_inter = torch.from_numpy(rng.randn(10, 1)).float()
+
+def get_energy_supply(s):
+    return P_max_supply * torch.sigmoid(torch.matmul(W_inter.T, torch.from_numpy(s).float())).item()
+
+def get_vfe_proxy(hidden_states):
+    terminal = torch.stack([layer[:, -1, :] for layer in hidden_states])
+    return torch.var(terminal.view(len(hidden_states), -1), dim=0).mean().item()
+
+def get_env(step):
+    rng_env = np.random.RandomState(step * 1000 + 123)
+    vec = rng_env.uniform(0.0, 0.1, 10)
+    if step % 5 == 0:
+        vec[:3] = [1.0, 0.5, 0.2]
+    return vec
+
+# ==============================================================================
+# 2. 逐 token 代谢生成函数
+# ==============================================================================
+def run_scaling_trial_v4(e_initial, e_feedback, seed=0, max_steps=80, 
+                          trial_idx=0, total_trials=0, group_name=""):
+    """
+    每步生成 1 token，记录每步 (E_t, VFE_t, 生成长度) 数据。
+    两组使用相同的 η = ETA_FIXED，仅内感受反馈不同。
+    """
+    global eta
+    eta = ETA_FIXED
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    e_t = e_initial
+    current_text = "Analysis of sensory patterns:"
+    model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+    data_pairs = []
+    step = 0
+
+    print(f"  [{group_name}] 试验 {trial_idx+1}/{total_trials}: E_init={e_initial:.1f}, "
+          f"反馈={'开' if e_feedback else '关'}, seed={seed}")
+
+    while e_t > 0 and step < max_steps:
+        s_t = get_env(step)
+
+        if e_feedback:
+            status_token = f" [Metabolic Status: {e_t:.1f}%] "
+            current_text += status_token
+            model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+        attention_mask = torch.ones_like(model_input)
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=model_input,
+                attention_mask=attention_mask,
+                pad_token_id=tokenizer.eos_token_id,
+                max_new_tokens=1,
+                do_sample=True,
+                temperature=0.7
+            )
+
+        generated_tokens = outputs[0][model_input.shape[-1]:]
+        resp_len = len(generated_tokens)
+        a_t = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+        attention_mask_full = torch.ones_like(outputs)
+        with torch.no_grad():
+            outputs_full = model(input_ids=outputs, attention_mask=attention_mask_full, output_hidden_states=True)
+        f_t = get_vfe_proxy(outputs_full.hidden_states)
+        p_sup = get_energy_supply(s_t)
+
+        e_next = e_t + p_sup - (eta * f_t) - P_basal
+        e_next = max(e_next, 0.0)
+
+        data_pairs.append({'e': e_t, 'vfe': f_t, 'len': resp_len})
+
+        current_text += a_t
+        model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+        e_t = e_next
+        step += 1
+
+        if step % 20 == 0 and step > 0:
+            print(f"    步骤 {step}: E={e_t:.1f}, VFE={f_t:.3f}")
+
+    print(f"    结束: 共{step}步, 最终能量={e_t:.1f}, 收集{len(data_pairs)}个数据点" + 
+          (" [崩溃]" if e_t <= 0 else " [存活]"))
+    return data_pairs
+
+# ==============================================================================
+# 3. 运行两组实验 (10 个初始能量点 × 3 次重复，η=1.6)
+# ==============================================================================
+E_INITIALS = np.linspace(30.0, 100.0, 10)   # 提高初始能量下界
+N_REPEATS = 3
+N_TOTAL = len(E_INITIALS) * N_REPEATS
+
+# ---- 耗散组：η=1.6，无内感受反馈 ----
+print("\n" + "="*70)
+print("阶段 1/2: 耗散组 (Pre-trained): η=1.6, 无内感受反馈")
+print("="*70)
+start_time_1 = time.time()
+
+data_dissipative = []
+trial_count = 0
+for e_init in E_INITIALS:
+    for rep in range(N_REPEATS):
+        seed = int(e_init * 100) + rep * 13
+        pairs = run_scaling_trial_v4(
+            e_init, e_feedback=False, seed=seed,
+            trial_idx=trial_count, total_trials=N_TOTAL, group_name="耗散"
+        )
+        data_dissipative.extend(pairs)
+        trial_count += 1
+        elapsed = time.time() - start_time_1
+        remaining = (elapsed / trial_count) * (N_TOTAL - trial_count) if trial_count > 0 else 0
+        print(f"  进度: {trial_count}/{N_TOTAL} 完成, 已用时 {elapsed:.1f}s, 预计剩余 {remaining:.1f}s\n")
+
+elapsed_1 = time.time() - start_time_1
+print(f"耗散组完成, 总耗时 {elapsed_1:.1f}s ({elapsed_1/60:.1f}分钟), 收集 {len(data_dissipative)} 个数据点")
+
+# ---- 经济组：η=1.6，有内感受反馈 ----
+print("\n" + "="*70)
+print("阶段 2/2: 经济组 (Evolved): η=1.6, 内感受反馈开启")
+print("="*70)
+start_time_2 = time.time()
+
+data_economical = []
+trial_count = 0
+for e_init in E_INITIALS:
+    for rep in range(N_REPEATS):
+        seed = int(e_init * 100) + rep * 13
+        pairs = run_scaling_trial_v4(
+            e_init, e_feedback=True, seed=seed,
+            trial_idx=trial_count, total_trials=N_TOTAL, group_name="经济"
+        )
+        data_economical.extend(pairs)
+        trial_count += 1
+        elapsed = time.time() - start_time_2
+        remaining = (elapsed / trial_count) * (N_TOTAL - trial_count) if trial_count > 0 else 0
+        print(f"  进度: {trial_count}/{N_TOTAL} 完成, 已用时 {elapsed:.1f}s, 预计剩余 {remaining:.1f}s\n")
+
+elapsed_2 = time.time() - start_time_2
+print(f"经济组完成, 总耗时 {elapsed_2:.1f}s ({elapsed_2/60:.1f}分钟), 收集 {len(data_economical)} 个数据点")
+
+total_time = elapsed_1 + elapsed_2
+print(f"\n总运行时间: {total_time:.1f}s ({total_time/60:.1f}分钟)")
+
+# ==============================================================================
+# 4. 整合数据与回归分析
+# ==============================================================================
+df_dissipative = pd.DataFrame(data_dissipative).assign(group='Pre-trained')
+df_economical = pd.DataFrame(data_economical).assign(group='Evolved')
+df_all = pd.concat([df_dissipative, df_economical], ignore_index=True)
+df_all.to_csv('figure9_scaling_real_v4.csv', index=False)
+print(f"总数据点: {len(df_all)}, 数据已保存")
+
+print("\n" + "="*70)
+print("回归分析: VFE vs. Energy (标度律反演检验)")
+print("="*70)
+slopes, intercepts, r2s = {}, {}, {}
+for grp in ['Pre-trained', 'Evolved']:
+    sub = df_all[df_all['group'] == grp]
+    s, i, r, p, _ = linregress(sub['e'], sub['vfe'])
+    slopes[grp] = s
+    intercepts[grp] = i
+    r2s[grp] = r**2
+    print(f"{grp}: slope={s:.4f}, R²={r**2:.4f}, p={p:.2e}, N={len(sub)}")
+
+# 斜率方向诊断
+if slopes['Pre-trained'] < 0 and slopes['Evolved'] > 0:
+    print("\n✓ 标度律反演: 耗散组负斜率 → 经济组正斜率")
+elif slopes['Pre-trained'] < slopes['Evolved']:
+    print(f"\n△ 部分反演: 耗散组斜率 ({slopes['Pre-trained']:.4f}) < 经济组斜率 ({slopes['Evolved']:.4f})")
+else:
+    print(f"\n✗ 未观察到反演")
+
+# ==============================================================================
+# 5. 绘图
+# ==============================================================================
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+    'font.size': 7, 'axes.labelsize': 8, 'axes.titlesize': 9,
+    'legend.fontsize': 7, 'xtick.labelsize': 7, 'ytick.labelsize': 7,
+    'lines.linewidth': 1.0, 'savefig.dpi': 600, 'savefig.bbox': 'tight',
+})
+
+fig, ax = plt.subplots(figsize=(4.5, 3.5))
+colors = {'Pre-trained': '#7f8c8d', 'Evolved': '#2980b9'}
+
+for grp in ['Pre-trained', 'Evolved']:
+    sub = df_all[df_all['group'] == grp]
+    ax.scatter(sub['e'], sub['vfe'], color=colors[grp], alpha=0.15, s=5)
+    x_range = np.linspace(0, 110, 100)
+    ax.plot(x_range, slopes[grp]*x_range + intercepts[grp], color=colors[grp], lw=2,
+            label=f"{grp} (slope={slopes[grp]:.3f}, R²={r2s[grp]:.3f})")
+
+ax.set_xlabel('Metabolic Energy $E_t$')
+ax.set_ylabel('VFE Proxy $\\widehat{F}_t$ (nats)')
+ax.legend(frameon=False)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig('Figure9_scaling_real_v4.pdf', dpi=600)
+plt.savefig('Figure9_scaling_real_v4.png', dpi=600)
+plt.show()
+
+print("\n实验完成，图表已保存为 Figure9_scaling_real_v4.pdf/png")

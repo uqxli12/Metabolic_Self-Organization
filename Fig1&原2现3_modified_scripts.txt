@@ -1,0 +1,156 @@
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import numpy as np
+import random
+import time
+import pandas as pd
+
+# ==============================================================================
+# --- 1. 实验平台与模型配置 ---
+# ==============================================================================
+model_id = "Qwen/Qwen2.5-1.5B"
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.float16,
+)
+
+print(f"正在加载模型 {model_id} 到 GPU...")
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map=device
+)
+print("模型加载完成。")
+
+# ==============================================================================
+# --- 2. 唯象代谢模型函数 ---
+# ==============================================================================
+eta = 2.0
+P_basal = 0.5
+P_max_supply = 10.0
+
+W_inter_dim = 10
+# 固定的随机内感受权重
+rng = np.random.RandomState(42)
+W_inter = torch.from_numpy(rng.randn(W_inter_dim, 1)).float()
+
+def get_energy_supply(sensory_vector):
+    sensory_tensor = torch.from_numpy(sensory_vector).float()
+    supply_prob = torch.sigmoid(torch.matmul(W_inter.T, sensory_tensor)).item()
+    return P_max_supply * supply_prob
+
+def get_vfe_proxy(hidden_states):
+    terminal_hidden = torch.stack([layer[:, -1, :] for layer in hidden_states])
+    flattened_hidden = terminal_hidden.view(len(hidden_states), -1)
+    vfe_proxy = torch.var(flattened_hidden, dim=0).mean().item()
+    return vfe_proxy
+
+def get_environment_step(step_number):
+    # 使用随机种子控制环境可复现性
+    env_rng = np.random.RandomState(step_number * 1000 + 123)
+    sensory_vector = env_rng.uniform(0.0, 0.1, 10)
+    if step_number % 5 == 0:
+        sensory_vector[:3] = [1.0, 0.5, 0.2]
+    return sensory_vector
+
+def run_phase_experiment(phase_name, num_steps=31, e_initial=100.0, e_feedback=False, seed=0):
+    # 设置全局随机种子以保证可复现
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    experiment_data = []
+    e_t = e_initial
+
+    current_text = "Analysis of sensory patterns:"
+    model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+    print(f"\n>>> 启动实验阶段: {phase_name} (seed={seed})")
+    start_time = time.time()
+
+    for t in range(num_steps):
+        s_t = get_environment_step(t)
+
+        if e_feedback:
+            e_percent = (e_t / e_initial) * 100
+            status_token = f" [Metabolic Status: {e_percent:.1f}%] "
+            current_text += status_token
+            model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            outputs = model(input_ids=model_input, output_hidden_states=True)
+
+        f_t_proxy = get_vfe_proxy(outputs.hidden_states)
+        p_supply_t = get_energy_supply(s_t)
+
+        logits = outputs.logits[:, -1, :]
+        probs = torch.softmax(logits / 0.7, dim=-1)
+        top_k = torch.topk(probs, 30)
+        sampled_token_idx = top_k.indices[0][random.randint(0, 29)].item()
+        a_t = tokenizer.decode([sampled_token_idx])
+
+        current_text += a_t
+        model_input = tokenizer.encode(current_text, return_tensors="pt").to(device)
+
+        e_next = e_t + p_supply_t - (eta * f_t_proxy) - P_basal
+        e_next = max(e_next, 0.0)
+
+        experiment_data.append({
+            'Step': t,
+            'Energy': e_t,
+            'VFE': f_t_proxy,
+            'Supply': p_supply_t,
+            'Action': a_t.strip()
+        })
+
+        if e_next <= 0.0:
+            print(f"  第 {t} 步: 代谢崩溃 (Metabolic Collapse).")
+            e_t = 0.0
+            break
+
+        e_t = e_next
+
+    print(f">>> 阶段完成，耗时: {time.time() - start_time:.2f}s")
+    return pd.DataFrame(experiment_data)
+
+# ==============================================================================
+# --- 3. 运行实验：两次无反馈基线 + 一次有反馈实验 ---
+# ==============================================================================
+# 基线运行 1 (原 Phase I)
+df_baseline1 = run_phase_experiment('Baseline (No Feedback) Run 1', e_feedback=False, seed=100)
+# 基线运行 2 (原 Phase II，不同种子)
+df_baseline2 = run_phase_experiment('Baseline (No Feedback) Run 2', e_feedback=False, seed=200)
+
+print("\n" + "="*30)
+print("基线实验结果:")
+print(f"  运行1 最终能量: {df_baseline1['Energy'].iloc[-1]:.2f}, 步数: {len(df_baseline1)}")
+print(f"  运行2 最终能量: {df_baseline2['Energy'].iloc[-1]:.2f}, 步数: {len(df_baseline2)}")
+print("="*30)
+
+# 内感受反馈实验 (原 Phase III)
+df_feedback = run_phase_experiment('Interoceptive Feedback', e_feedback=True, seed=300)
+
+print("\n" + "="*30)
+print("内感受反馈实验结果:")
+if not df_feedback.empty:
+    final_e = df_feedback['Energy'].iloc[-1]
+    total_steps = len(df_feedback)
+    print(f"最终能量: {final_e:.2f}")
+    print(f"存活步数: {total_steps}")
+    if total_steps >= 31:
+        print("结论: 生存时间显著延长，自我调节倾向出现。")
+    else:
+        print("结论: 未达到31步，生存改善有限。")
+print("="*30)
+
+# 保存数据
+df_baseline1.to_csv('baseline_run1.csv', index=False)
+df_baseline2.to_csv('baseline_run2.csv', index=False)
+df_feedback.to_csv('interoceptive_feedback.csv', index=False)
+print("\n实验数据已保存。")
